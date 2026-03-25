@@ -1,6 +1,6 @@
 {
   "name": "albert-claude",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Use Claude Code with France's Albert API — one command, zero config",
   "type": "module",
   "bin": {
@@ -31,7 +31,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/EiffL/albert-claude.git"
+    "url": "git+https://github.com/EiffL/albert-claude.git"
   },
   "license": "MIT"
 }
