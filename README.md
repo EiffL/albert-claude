@@ -32,7 +32,7 @@ It works by running a lightweight local translation proxy that converts between 
 
 Albert is available to French public administration employees.
 
-1. Go to [albert.sites.beta.gouv.fr](https://albert.sites.beta.gouv.fr/)
+1. Go to [albert.playground.etalab.gouv.fr](https://albert.playground.etalab.gouv.fr/)
 2. Create an account with your government email address
 3. Once logged in, navigate to your account settings to generate an API key
 4. Keep this key safe — you'll need it during setup
