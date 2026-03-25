@@ -109,7 +109,7 @@ function readBody(req) {
  * @returns {Promise<{server: http.Server, port: number}>}
  */
 export function startProxy({ port = 0, baseUrl, apiKey, model, debug = false }) {
-  const info = (...args) => console.error('[proxy]', ...args);
+  const info = debug ? (...args) => console.error('[proxy]', ...args) : () => {};
   const dbg = debug ? (...args) => console.error('[proxy:debug]', ...args) : () => {};
 
   const server = http.createServer(async (req, res) => {

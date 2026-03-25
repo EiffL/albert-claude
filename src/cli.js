@@ -95,7 +95,7 @@ async function main() {
   }
 
   // Start proxy
-  process.stderr.write('  Starting proxy... ');
+  if (opts.debug) process.stderr.write('  Starting proxy... ');
   const { server, port } = await startProxy({
     port: 0,
     baseUrl: config.baseUrl,
@@ -103,11 +103,7 @@ async function main() {
     model,
     debug: opts.debug,
   });
-  console.error(`ok (port ${port})`);
-
-  // Launch claude
-  console.error('  Launching Claude Code...');
-  console.error('');
+  if (opts.debug) console.error(`ok (port ${port})`);
 
   const claudeEnv = {
     ...process.env,
