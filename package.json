@@ -1,0 +1,33 @@
+{
+  "name": "albert-claude",
+  "version": "0.1.0",
+  "description": "Use Claude Code with France's Albert API — one command, zero config",
+  "type": "module",
+  "bin": {
+    "albert-claude": "bin/albert-claude"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/test-translate.js test/test-stream.js test/test-integration.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "albert",
+    "opengatellm",
+    "etalab",
+    "anthropic",
+    "openai",
+    "proxy",
+    "france",
+    "administration"
+  ],
+  "license": "MIT"
+}
