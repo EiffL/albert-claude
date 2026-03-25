@@ -74,17 +74,17 @@ npx albert-claude
 
 ### Make it a single command
 
-Add an alias to your shell config so you can just type `albert`:
+Add an alias to your shell config so you can just type `albert-claude`:
 
 ```bash
 # Add to ~/.bashrc or ~/.zshrc:
-alias albert="npx albert-claude"
+alias albert-claude="npx albert-claude"
 ```
 
 Then reload your shell (`source ~/.zshrc`) and from now on:
 
 ```bash
-albert
+albert-claude
 ```
 
 Alternatively, install globally to skip npx entirely:
