@@ -23,7 +23,7 @@ Claude Code → POST /v1/messages → proxy (127.0.0.1:random) → POST /v1/chat
 
 **Key modules in `src/`:**
 
-- **cli.js** — Entry point. Parses args, loads config, starts proxy, spawns Claude Code as child process with `ANTHROPIC_BASE_URL` pointing to the local proxy, handles shutdown signals.
+- **cli.js** — Entry point. Parses args (including `--select-model` flag), loads config, starts proxy, spawns Claude Code as child process with `ANTHROPIC_BASE_URL` pointing to the local proxy, handles shutdown signals.
 - **config.js** — Reads/writes `~/.config/le-claude/config.json` (API key, model, base URL). Interactive setup flow fetches available models from Albert.
 - **proxy.js** — HTTP server on localhost. Handles `/v1/messages` (main proxy) and `/v1/messages/count_tokens` (stub). Supports both streaming and non-streaming responses.
 - **translate.js** — Pure functions for format conversion. Request: Anthropic content blocks → OpenAI messages, tool definitions, tool_choice. Response: OpenAI completion → Anthropic message format. Strips thinking blocks, filters BatchTool, removes `format: "uri"` from schemas.

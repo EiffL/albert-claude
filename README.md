@@ -110,7 +110,7 @@ npx le-claude [options] [-- claude-args...]
 
 Options:
   --setup         Re-run interactive setup (change API key or model)
-  --model MODEL   Override the model for this session
+  --select-model   Use the first available model from the API for this session
   --debug         Enable proxy debug logging
   -h, --help      Show help
 ```
@@ -119,7 +119,7 @@ Examples:
 
 ```bash
 npx le-claude --debug                    # See request/response details
-npx le-claude --model openai/gpt-oss-40b # Use a different model
+npx le-claude --select-model # Use the first available model from the API
 npx le-claude --setup                    # Change API key or model
 npx le-claude -- -p "Fix the bug"        # Pass arguments to Claude Code
 ```
