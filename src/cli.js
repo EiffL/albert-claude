@@ -15,13 +15,13 @@ import readline from 'node:readline';
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  const opts = { debug: false, selectModel: false, setup: false, help: false, claudeArgs: [] };
+  const opts = { debug: false, model: false, setup: false, help: false, claudeArgs: [] };
   let i = 0;
   while (i < args.length) {
     if (args[i] === '--debug') { opts.debug = true; i++; }
     else if (args[i] === '--setup') { opts.setup = true; i++; }
     else if (args[i] === '--help' || args[i] === '-h') { opts.help = true; i++; }
-    else if (args[i] === '--select-model') { opts.selectModel = true; i++; }
+    else if (args[i] === '--model') { opts.model = true; i++; }
     else if (args[i] === '--') { opts.claudeArgs = args.slice(i + 1); break; }
     else { opts.claudeArgs = args.slice(i); break; }
   }
@@ -36,15 +36,15 @@ function printHelp() {
     npx le-claude [options] [-- claude-args...]
 
   Options:
-    --setup         Re-run interactive setup
-    --select-model   Select an available model from the API for this session
+    --setup         Configure le-claude (API key and/or default model)
+    --model         Choose which model to use for this session
     --debug         Enable proxy debug logging
     -h, --help      Show this help message
 
   Examples:
     npx le-claude                  Start Claude Code with Albert
     npx le-claude --debug          Start with debug logging
-    npx le-claude --select-model   Select model from API
+    npx le-claude --model          Choose a model for this session
     npx le-claude -- --help        Pass --help to Claude Code
 
   Configuration is stored in ~/.config/le-claude/config.json
@@ -85,11 +85,11 @@ async function main() {
 
   // CLI overrides
   let model;
-  if (opts.selectModel) {
+  if (opts.model) {
     try {
       model = await selectModel(config.baseUrl, config.apiKey);
     } catch (e) {
-      console.error(`  Warning: failed to fetch models for --select-model flag: ${e.message}`);
+      console.error(`  Warning: failed to fetch models for --model flag: ${e.message}`);
       model = config.model;
     }
   } else {

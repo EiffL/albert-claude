@@ -106,47 +106,109 @@ export async function interactiveSetup(existingConfig = null) {
     console.error('');
 
     if (!existingConfig) {
+      // First-time setup: ask for everything
       console.error('  No configuration found. Let\'s set things up!');
       console.error('');
+      return await fullSetup(rl, null);
     }
 
-    // API key
-    const apiKey = await ask(rl, '  Albert API Key: ');
-    if (!apiKey.trim()) {
-      console.error('  API key is required.');
-      process.exit(1);
+    // Reconfiguration: let the user choose what to change
+    console.error('  Current configuration:');
+    console.error(`    API key: ${existingConfig.apiKey.slice(0, 8)}...`);
+    console.error(`    Model:   ${existingConfig.model}`);
+    console.error('');
+    console.error('  What would you like to change?');
+    console.error('    1. API key');
+    console.error('    2. Default model');
+    console.error('    3. Both');
+    console.error('');
+    const choice = await ask(rl, '  Choice [2]: ');
+    const option = parseInt(choice, 10) || 2;
+
+    let apiKey = existingConfig.apiKey;
+    let baseUrl = existingConfig.baseUrl || DEFAULT_BASE_URL;
+    let model = existingConfig.model;
+
+    if (option === 1 || option === 3) {
+      const newKey = await ask(rl, '  New Albert API Key: ');
+      if (!newKey.trim()) {
+        console.error('  API key is required.');
+        process.exit(1);
+      }
+      apiKey = newKey.trim();
+
+      // Test the new key
+      process.stderr.write('  Testing connection... ');
+      try {
+        await fetchModels(baseUrl, apiKey);
+        console.error('ok');
+      } catch (err) {
+        console.error(`failed: ${err.message}`);
+        console.error('  Please check your API key and try again.');
+        process.exit(1);
+      }
     }
 
-    const baseUrl = existingConfig?.baseUrl || DEFAULT_BASE_URL;
-
-    // Test connection
-    process.stderr.write('  Testing connection... ');
-    let models;
-    try {
-      models = await fetchModels(baseUrl, apiKey.trim());
-      console.error('ok');
-    } catch (err) {
-      console.error(`failed: ${err.message}`);
-      console.error('  Please check your API key and try again.');
-      process.exit(1);
+    if (option === 2 || option === 3) {
+      process.stderr.write('  Fetching models... ');
+      let models;
+      try {
+        models = await fetchModels(baseUrl, apiKey);
+        console.error('ok');
+      } catch (err) {
+        console.error(`failed: ${err.message}`);
+        console.error('  Could not fetch models. Please check your API key.');
+        process.exit(1);
+      }
+      model = await pickModel(rl, models);
     }
 
-    // Model selection
-    const model = await pickModel(rl, models);
-
-    const config = {
-      apiKey: apiKey.trim(),
-      model,
-      baseUrl,
-    };
-
+    const config = { apiKey, model, baseUrl };
     saveConfig(config);
     console.error('');
     console.error(`  Configuration saved to ${configPath()}`);
     console.error('');
-
     return config;
   } finally {
     rl.close();
   }
+}
+
+/** Full first-time setup flow. */
+async function fullSetup(rl, existingConfig) {
+  const apiKey = await ask(rl, '  Albert API Key: ');
+  if (!apiKey.trim()) {
+    console.error('  API key is required.');
+    process.exit(1);
+  }
+
+  const baseUrl = existingConfig?.baseUrl || DEFAULT_BASE_URL;
+
+  // Test connection
+  process.stderr.write('  Testing connection... ');
+  let models;
+  try {
+    models = await fetchModels(baseUrl, apiKey.trim());
+    console.error('ok');
+  } catch (err) {
+    console.error(`failed: ${err.message}`);
+    console.error('  Please check your API key and try again.');
+    process.exit(1);
+  }
+
+  // Model selection
+  const model = await pickModel(rl, models);
+
+  const config = {
+    apiKey: apiKey.trim(),
+    model,
+    baseUrl,
+  };
+
+  saveConfig(config);
+  console.error('');
+  console.error(`  Configuration saved to ${configPath()}`);
+  console.error('');
+
+  return config;
 }

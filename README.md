@@ -109,8 +109,8 @@ le-claude
 npx le-claude [options] [-- claude-args...]
 
 Options:
-  --setup         Re-run interactive setup (change API key or model)
-  --select-model   Use the first available model from the API for this session
+  --setup         Configure le-claude (API key and/or default model)
+  --model         Choose which model to use for this session
   --debug         Enable proxy debug logging
   -h, --help      Show help
 ```
@@ -119,8 +119,8 @@ Examples:
 
 ```bash
 npx le-claude --debug                    # See request/response details
-npx le-claude --select-model # Use the first available model from the API
-npx le-claude --setup                    # Change API key or model
+npx le-claude --model                    # Choose a model for this session
+npx le-claude --setup                    # Change API key or default model
 npx le-claude -- -p "Fix the bug"        # Pass arguments to Claude Code
 ```
 
