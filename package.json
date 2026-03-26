@@ -1,6 +1,6 @@
 {
   "name": "le-claude",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Use Claude Code with France's Albert API — one command, zero config",
   "type": "module",
   "bin": {
