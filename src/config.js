@@ -61,6 +61,38 @@ export async function fetchModels(baseUrl, apiKey) {
     .sort((a, b) => (a.id || '').localeCompare(b.id || ''));
 }
 
+/** Interactive model picker. Shows available models and returns chosen ID. */
+async function pickModel(rl, models) {
+  if (models.length === 0) {
+    console.error('  No text-generation models found. Enter model ID manually.');
+    return await ask(rl, '  Model ID: ');
+  }
+  console.error('');
+  console.error('  Available models:');
+  models.forEach((m, i) => {
+    const type = m.type ? ` (${m.type})` : '';
+    console.error(`    ${i + 1}. ${m.id}${type}`);
+  });
+  console.error('');
+  const choice = await ask(rl, '  Select model [1]: ');
+  const idx = (parseInt(choice, 10) || 1) - 1;
+  return models[Math.max(0, Math.min(idx, models.length - 1))].id;
+}
+
+/** Fetch models and interactively select one. Returns model ID string. */
+export async function selectModel(baseUrl, apiKey) {
+  const models = await fetchModels(baseUrl, apiKey);
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stderr,
+  });
+  try {
+    return await pickModel(rl, models);
+  } finally {
+    rl.close();
+  }
+}
+
 /** Run interactive setup. Returns config object. */
 export async function interactiveSetup(existingConfig = null) {
   const rl = readline.createInterface({
@@ -100,22 +132,7 @@ export async function interactiveSetup(existingConfig = null) {
     }
 
     // Model selection
-    let model;
-    if (models.length === 0) {
-      console.error('  No text-generation models found. Enter model ID manually.');
-      model = await ask(rl, '  Model ID: ');
-    } else {
-      console.error('');
-      console.error('  Available models:');
-      models.forEach((m, i) => {
-        const type = m.type ? ` (${m.type})` : '';
-        console.error(`    ${i + 1}. ${m.id}${type}`);
-      });
-      console.error('');
-      const choice = await ask(rl, `  Select model [1]: `);
-      const idx = (parseInt(choice, 10) || 1) - 1;
-      model = models[Math.max(0, Math.min(idx, models.length - 1))].id;
-    }
+    const model = await pickModel(rl, models);
 
     const config = {
       apiKey: apiKey.trim(),
