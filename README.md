@@ -145,7 +145,8 @@ When Claude Code exits, the proxy stops automatically.
 - **No data logging** — message content and API keys are never logged (even in debug mode, content is truncated)
 - **Zero dependencies** — no npm packages, no supply chain risk. Pure Node.js builtins
 - **Your API key** is stored in `~/.config/le-claude/config.json` with `600` permissions (owner-only read)
-- **Direct connection** — your data goes from your machine straight to Albert's API. Nothing in between
+- **Direct connection** — your data goes from your machine straight to Albert API. Nothing in between
+- **SecNumCloud certification** — Albert API ensures all data are processed in a [secure cloud environment](https://albert.sites.beta.gouv.fr/solutions/security/)
 
 ## Important notes
 
