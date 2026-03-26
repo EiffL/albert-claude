@@ -57,7 +57,7 @@ export async function fetchModels(baseUrl, apiKey) {
 
   // Filter to text-generation models and sort by name
   return (data.data || [])
-    .filter(m => m.type === 'text-generation' || m.id?.includes('gpt') || m.id?.includes('llama'))
+    .filter(m => m.type === 'text-generation' || m.id?.includes('Instruct'))
     .sort((a, b) => (a.id || '').localeCompare(b.id || ''));
 }
 
