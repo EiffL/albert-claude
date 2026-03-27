@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { stripUriFormat, translateRequest, translateResponse } from '../src/translate.js';
+import { stripUriFormat, translateRequest, translateResponse, parseTextToolCalls, fixTextToolCalls } from '../src/translate.js';
 
 // ---------------------------------------------------------------------------
 // stripUriFormat
@@ -119,17 +119,17 @@ describe('translateRequest', () => {
     assert.deepEqual(JSON.parse(msg.tool_calls[0].function.arguments), { query: 'test' });
   });
 
-  it('translates tool_result to separate message', () => {
+  it('translates tool_result to tool message without empty user message', () => {
     const result = translateRequest({
       messages: [{
         role: 'user',
         content: [{ type: 'tool_result', tool_use_id: 'call_abc', content: 'found it' }],
       }],
     }, 'gpt-4');
-    assert.equal(result.messages.length, 2);
-    assert.equal(result.messages[1].role, 'tool');
-    assert.equal(result.messages[1].content, 'found it');
-    assert.equal(result.messages[1].tool_call_id, 'call_abc');
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0].role, 'tool');
+    assert.equal(result.messages[0].content, 'found it');
+    assert.equal(result.messages[0].tool_call_id, 'call_abc');
   });
 
   it('prefixes error tool results', () => {
@@ -139,7 +139,7 @@ describe('translateRequest', () => {
         content: [{ type: 'tool_result', tool_use_id: 'x', content: 'not found', is_error: true }],
       }],
     }, 'gpt-4');
-    assert.equal(result.messages[1].content, 'Error: not found');
+    assert.equal(result.messages[0].content, 'Error: not found');
   });
 
   it('strips thinking blocks', () => {
@@ -281,5 +281,173 @@ describe('translateResponse', () => {
       usage: { prompt_tokens: 5, completion_tokens: 100 },
     }, 'gpt-4');
     assert.equal(result.stop_reason, 'max_tokens');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseTextToolCalls
+// ---------------------------------------------------------------------------
+
+describe('parseTextToolCalls', () => {
+  it('returns empty for plain text', () => {
+    const result = parseTextToolCalls('Hello, how are you?');
+    assert.equal(result.toolCalls.length, 0);
+    assert.equal(result.text, 'Hello, how are you?');
+  });
+
+  it('returns empty for null/empty', () => {
+    assert.equal(parseTextToolCalls(null).toolCalls.length, 0);
+    assert.equal(parseTextToolCalls('').toolCalls.length, 0);
+  });
+
+  // --- Mistral format ---
+
+  it('parses Mistral single tool call', () => {
+    const result = parseTextToolCalls('[TOOL_CALLS]Bash{"command": "ls"}');
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].function.name, 'Bash');
+    assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), { command: 'ls' });
+    assert.equal(result.text, '');
+  });
+
+  it('parses Mistral multiple tool calls', () => {
+    const text = '[TOOL_CALLS]Bash{"command": "ls"}[TOOL_CALLS]Read{"file_path": "/tmp/foo"}';
+    const result = parseTextToolCalls(text);
+    assert.equal(result.toolCalls.length, 2);
+    assert.equal(result.toolCalls[0].function.name, 'Bash');
+    assert.equal(result.toolCalls[1].function.name, 'Read');
+    assert.deepEqual(JSON.parse(result.toolCalls[1].function.arguments), { file_path: '/tmp/foo' });
+  });
+
+  it('parses Mistral JSON array format', () => {
+    const text = '[TOOL_CALLS] [{"name": "Bash", "arguments": {"command": "ls"}}]';
+    const result = parseTextToolCalls(text);
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].function.name, 'Bash');
+    assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), { command: 'ls' });
+  });
+
+  it('parses Mistral with nested JSON', () => {
+    const text = '[TOOL_CALLS]Bash{"command": "echo \\\"hello {world}\\\""}';
+    const result = parseTextToolCalls(text);
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].function.name, 'Bash');
+  });
+
+  it('preserves text before Mistral tool calls', () => {
+    const text = 'I will run this command.\n[TOOL_CALLS]Bash{"command": "ls"}';
+    const result = parseTextToolCalls(text);
+    assert.equal(result.toolCalls.length, 1);
+    assert.ok(result.text.includes('I will run this command'));
+  });
+
+  // --- Qwen3 / Hermes format ---
+
+  it('parses Hermes <tool_call> JSON', () => {
+    const text = '<tool_call>{"name": "Bash", "arguments": {"command": "ls"}}</tool_call>';
+    const result = parseTextToolCalls(text);
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].function.name, 'Bash');
+    assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), { command: 'ls' });
+  });
+
+  it('parses multiple <tool_call> blocks', () => {
+    const text = '<tool_call>{"name": "Bash", "arguments": {"command": "ls"}}</tool_call>\n<tool_call>{"name": "Read", "arguments": {"file_path": "/tmp"}}</tool_call>';
+    const result = parseTextToolCalls(text);
+    assert.equal(result.toolCalls.length, 2);
+    assert.equal(result.toolCalls[0].function.name, 'Bash');
+    assert.equal(result.toolCalls[1].function.name, 'Read');
+  });
+
+  it('parses Qwen3 XML parameters', () => {
+    const text = '<tool_call><function=Bash><parameter=command>ls -la</parameter><parameter=description>List files</parameter></function></tool_call>';
+    const result = parseTextToolCalls(text);
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].function.name, 'Bash');
+    const args = JSON.parse(result.toolCalls[0].function.arguments);
+    assert.equal(args.command, 'ls -la');
+    assert.equal(args.description, 'List files');
+  });
+
+  it('parses bare <function=Name> without <tool_call> wrapper', () => {
+    const text = '<function=Agent><parameter=subagent_type>Explore</parameter><parameter=prompt>Explore the repo</parameter></function>';
+    const result = parseTextToolCalls(text);
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].function.name, 'Agent');
+    const args = JSON.parse(result.toolCalls[0].function.arguments);
+    assert.equal(args.subagent_type, 'Explore');
+    assert.equal(args.prompt, 'Explore the repo');
+  });
+
+  it('parses Qwen3 parameters without closing tags', () => {
+    const text = '<function=Agent>\n<parameter=subagent_type>\nExplore\n\n<parameter=prompt>\nExplore the repository structure</function>';
+    const result = parseTextToolCalls(text);
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].function.name, 'Agent');
+    const args = JSON.parse(result.toolCalls[0].function.arguments);
+    assert.equal(args.subagent_type, 'Explore');
+    assert.ok(args.prompt.includes('Explore the repository'));
+  });
+
+  it('parses Qwen3 with JSON body inside <function=>', () => {
+    const text = '<function=Bash>{"command": "ls", "description": "list files"}</function>';
+    const result = parseTextToolCalls(text);
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].function.name, 'Bash');
+    assert.deepEqual(JSON.parse(result.toolCalls[0].function.arguments), { command: 'ls', description: 'list files' });
+  });
+
+  it('does not false-positive on HTML-like text', () => {
+    const result = parseTextToolCalls('<h1>Hello world</h1>');
+    assert.equal(result.toolCalls.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fixTextToolCalls
+// ---------------------------------------------------------------------------
+
+describe('fixTextToolCalls', () => {
+  it('fixes response with text-based tool calls', () => {
+    const data = {
+      choices: [{
+        message: { role: 'assistant', content: '[TOOL_CALLS]Bash{"command": "ls"}' },
+        finish_reason: 'stop',
+      }],
+    };
+    fixTextToolCalls(data);
+    assert.equal(data.choices[0].message.tool_calls.length, 1);
+    assert.equal(data.choices[0].message.tool_calls[0].function.name, 'Bash');
+    assert.equal(data.choices[0].message.content, null);
+    assert.equal(data.choices[0].finish_reason, 'tool_calls');
+  });
+
+  it('does not modify response with proper tool_calls', () => {
+    const data = {
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: 'Some text with [TOOL_CALLS] in it',
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'Bash', arguments: '{}' } }],
+        },
+        finish_reason: 'tool_calls',
+      }],
+    };
+    fixTextToolCalls(data);
+    assert.equal(data.choices[0].message.content, 'Some text with [TOOL_CALLS] in it');
+    assert.equal(data.choices[0].message.tool_calls.length, 1);
+  });
+
+  it('does not modify plain text response', () => {
+    const data = {
+      choices: [{
+        message: { role: 'assistant', content: 'Just a normal response.' },
+        finish_reason: 'stop',
+      }],
+    };
+    fixTextToolCalls(data);
+    assert.equal(data.choices[0].message.content, 'Just a normal response.');
+    assert.equal(data.choices[0].message.tool_calls, undefined);
+    assert.equal(data.choices[0].finish_reason, 'stop');
   });
 });

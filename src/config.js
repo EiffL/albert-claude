@@ -114,13 +114,15 @@ export async function interactiveSetup(existingConfig = null) {
 
     // Reconfiguration: let the user choose what to change
     console.error('  Current configuration:');
-    console.error(`    API key: ${existingConfig.apiKey.slice(0, 8)}...`);
-    console.error(`    Model:   ${existingConfig.model}`);
+    console.error(`    API key:       ${existingConfig.apiKey.slice(0, 8)}...`);
+    console.error(`    Model:         ${existingConfig.model}`);
+    console.error(`    Web search:    ${existingConfig.braveApiKey ? 'Brave Search' : 'Marginalia (default)'}`);
     console.error('');
     console.error('  What would you like to change?');
     console.error('    1. API key');
     console.error('    2. Default model');
-    console.error('    3. Both');
+    console.error('    3. Web search provider');
+    console.error('    4. Everything');
     console.error('');
     const choice = await ask(rl, '  Choice [2]: ');
     const option = parseInt(choice, 10) || 2;
@@ -128,8 +130,9 @@ export async function interactiveSetup(existingConfig = null) {
     let apiKey = existingConfig.apiKey;
     let baseUrl = existingConfig.baseUrl || DEFAULT_BASE_URL;
     let model = existingConfig.model;
+    let braveApiKey = existingConfig.braveApiKey || '';
 
-    if (option === 1 || option === 3) {
+    if (option === 1 || option === 4) {
       const newKey = await ask(rl, '  New Albert API Key: ');
       if (!newKey.trim()) {
         console.error('  API key is required.');
@@ -149,7 +152,7 @@ export async function interactiveSetup(existingConfig = null) {
       }
     }
 
-    if (option === 2 || option === 3) {
+    if (option === 2 || option === 4) {
       process.stderr.write('  Fetching models... ');
       let models;
       try {
@@ -163,7 +166,11 @@ export async function interactiveSetup(existingConfig = null) {
       model = await pickModel(rl, models);
     }
 
-    const config = { apiKey, model, baseUrl };
+    if (option === 3 || option === 4) {
+      braveApiKey = await askBraveKey(rl);
+    }
+
+    const config = { apiKey, model, baseUrl, braveApiKey };
     saveConfig(config);
     console.error('');
     console.error(`  Configuration saved to ${configPath()}`);
@@ -172,6 +179,15 @@ export async function interactiveSetup(existingConfig = null) {
   } finally {
     rl.close();
   }
+}
+
+/** Ask for optional Brave Search API key. */
+async function askBraveKey(rl) {
+  console.error('');
+  console.error('  Web search uses Marginalia (Swedish, EU-funded) by default — no key needed.');
+  console.error('  For better results, you can add a free Brave Search API key.');
+  const key = await ask(rl, '  Brave Search API key (Enter to skip): ');
+  return key.trim();
 }
 
 /** Full first-time setup flow. */
@@ -199,10 +215,14 @@ async function fullSetup(rl, existingConfig) {
   // Model selection
   const model = await pickModel(rl, models);
 
+  // Optional Brave Search key
+  const braveApiKey = await askBraveKey(rl);
+
   const config = {
     apiKey: apiKey.trim(),
     model,
     baseUrl,
+    braveApiKey,
   };
 
   saveConfig(config);

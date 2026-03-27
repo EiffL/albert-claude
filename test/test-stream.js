@@ -157,4 +157,93 @@ describe('StreamTranslator', () => {
     assert.ok(names.includes('message_stop'));
     assert.ok(!names.includes('content_block_stop'));
   });
+
+  // --- Text-based tool call detection ---
+
+  it('detects Mistral [TOOL_CALLS] in stream', () => {
+    const t = new StreamTranslator('test-model');
+
+    // Simulate streaming [TOOL_CALLS]Bash{"command":"ls"}
+    const e1 = parseEvents(t.processChunk(makeChunk({ content: '[TOOL_' })));
+    // Should buffer (starts with [, could be [TOOL_CALLS])
+    const textEvents1 = e1.filter(e => e[0] === 'content_block_delta');
+    assert.equal(textEvents1.length, 0); // no text emitted yet
+
+    const e2 = parseEvents(t.processChunk(makeChunk({ content: 'CALLS]Bash{"command":"ls"}' })));
+    // Still buffering (tool call mode detected)
+    const textEvents2 = e2.filter(e => e[0] === 'content_block_delta');
+    assert.equal(textEvents2.length, 0);
+
+    // Finish: should parse and emit tool_use
+    const fin = parseEvents(t.finish());
+    const blockStart = fin.find(e => e[0] === 'content_block_start' && e[1].content_block?.type === 'tool_use');
+    assert.ok(blockStart, 'should emit tool_use block');
+    assert.equal(blockStart[1].content_block.name, 'Bash');
+
+    const jsonDelta = fin.find(e => e[0] === 'content_block_delta' && e[1].delta?.type === 'input_json_delta');
+    assert.ok(jsonDelta);
+    assert.deepEqual(JSON.parse(jsonDelta[1].delta.partial_json), { command: 'ls' });
+
+    const msgDelta = fin.find(e => e[0] === 'message_delta');
+    assert.equal(msgDelta[1].delta.stop_reason, 'tool_use');
+  });
+
+  it('detects Qwen3 <function=> in stream', () => {
+    const t = new StreamTranslator('test-model');
+
+    t.processChunk(makeChunk({ content: '<function=Bash>' }));
+    t.processChunk(makeChunk({ content: '<parameter=command>ls</parameter>' }));
+    t.processChunk(makeChunk({ content: '</function>' }));
+
+    const fin = parseEvents(t.finish());
+    const blockStart = fin.find(e => e[0] === 'content_block_start' && e[1].content_block?.type === 'tool_use');
+    assert.ok(blockStart, 'should emit tool_use block');
+    assert.equal(blockStart[1].content_block.name, 'Bash');
+  });
+
+  it('flushes normal text immediately when first char is not [ or <', () => {
+    const t = new StreamTranslator('test-model');
+
+    const events = parseEvents(t.processChunk(makeChunk({ content: 'Hello world' })));
+    const blockStart = events.find(e => e[0] === 'content_block_start');
+    assert.ok(blockStart, 'should emit text block immediately');
+    assert.equal(blockStart[1].content_block.type, 'text');
+
+    const delta = events.find(e => e[0] === 'content_block_delta');
+    assert.equal(delta[1].delta.text, 'Hello world');
+  });
+
+  it('flushes buffer after 15 chars if no prefix match', () => {
+    const t = new StreamTranslator('test-model');
+
+    // Send short text starting with < (still undecided, buffered)
+    const e1 = parseEvents(t.processChunk(makeChunk({ content: '<h1>Hi' })));
+    const textEvents1 = e1.filter(e => e[0] === 'content_block_delta');
+    assert.equal(textEvents1.length, 0, 'should buffer initially');
+
+    // Send more text to exceed 15 chars — triggers flush
+    const e2 = parseEvents(t.processChunk(makeChunk({ content: ' there world!</h1>' })));
+    const delta = e2.find(e => e[0] === 'content_block_delta');
+    assert.ok(delta, 'should have flushed buffered text');
+    assert.ok(delta[1].delta.text.includes('<h1>Hi there world!</h1>'));
+  });
+
+  it('emits buffered text as plain text if no tool calls found at finish', () => {
+    const t = new StreamTranslator('test-model');
+
+    // Send short text starting with < that doesn't match
+    t.processChunk(makeChunk({ content: '<hi>' }));
+    // Stream ends before 15 chars
+
+    const fin = parseEvents(t.finish());
+    const blockStart = fin.find(e => e[0] === 'content_block_start');
+    assert.ok(blockStart);
+    assert.equal(blockStart[1].content_block.type, 'text');
+
+    const delta = fin.find(e => e[0] === 'content_block_delta');
+    assert.equal(delta[1].delta.text, '<hi>');
+
+    const msgDelta = fin.find(e => e[0] === 'message_delta');
+    assert.equal(msgDelta[1].delta.stop_reason, 'end_turn');
+  });
 });

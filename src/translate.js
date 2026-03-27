@@ -6,6 +6,280 @@
  */
 
 // ---------------------------------------------------------------------------
+// Text-based tool call parsing
+// ---------------------------------------------------------------------------
+// Some models (Mistral, Qwen, etc.) emit tool calls as text instead of using
+// the OpenAI function calling API. These parsers detect and extract them.
+// Approach inspired by Ollama: tag detection + balanced-brace JSON extraction.
+
+/** Extract a balanced JSON object from text starting at startIdx. */
+function extractJsonObject(text, startIdx) {
+  if (startIdx >= text.length || text[startIdx] !== '{') return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return { json: text.slice(startIdx, i + 1), end: i + 1 };
+    }
+  }
+  return null;
+}
+
+/** Generate a 9-character alphanumeric ID compatible with vLLM/Mistral backends. */
+export function makeToolCallId() {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const bytes = new Uint8Array(9);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => chars[b % chars.length]).join('');
+}
+
+/**
+ * Recursively search a parsed JSON object for tool call name + arguments,
+ * following Ollama's findObject strategy.
+ */
+function findToolCallInObject(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  const name = obj.name || obj.function?.name;
+  if (name) {
+    let args = obj.arguments ?? obj.parameters ?? obj.function?.arguments ?? obj.function?.parameters;
+    if (typeof args === 'string') {
+      try { args = JSON.parse(args); } catch { /* keep as string */ }
+    }
+    if (args !== undefined) return { name, arguments: args };
+  }
+  for (const val of Object.values(obj)) {
+    if (typeof val === 'object' && val !== null) {
+      const found = findToolCallInObject(val);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+/** Parse Mistral [TOOL_CALLS] format. */
+function parseMistralToolCalls(text) {
+  if (!text.includes('[TOOL_CALLS]')) return { text, toolCalls: [] };
+
+  const toolCalls = [];
+  const parts = text.split('[TOOL_CALLS]');
+  const prefix = parts[0];
+  const leftover = [];
+
+  for (let i = 1; i < parts.length; i++) {
+    const part = parts[i].trimStart();
+
+    // Try JSON array: [{"name": ..., "arguments": ...}, ...]
+    if (part.startsWith('[')) {
+      const bracketEnd = part.indexOf(']');
+      if (bracketEnd >= 0) {
+        try {
+          const arr = JSON.parse(part.slice(0, bracketEnd + 1));
+          if (Array.isArray(arr)) {
+            for (const item of arr) {
+              const found = findToolCallInObject(item);
+              if (found) {
+                toolCalls.push({
+                  id: item.id || makeToolCallId(),
+                  type: 'function',
+                  function: {
+                    name: found.name,
+                    arguments: typeof found.arguments === 'string' ? found.arguments : JSON.stringify(found.arguments ?? {}),
+                  },
+                });
+              }
+            }
+            const after = part.slice(bracketEnd + 1).trim();
+            if (after) leftover.push(after);
+            continue;
+          }
+        } catch { /* fall through to Name{json} parsing */ }
+      }
+    }
+
+    // Try Name{json} format
+    const nameMatch = part.match(/^(\w+)\s*/);
+    if (nameMatch) {
+      const name = nameMatch[1];
+      const afterName = part.slice(nameMatch[0].length);
+      const jsonResult = extractJsonObject(afterName, 0);
+      if (jsonResult) {
+        try {
+          JSON.parse(jsonResult.json);
+          toolCalls.push({
+            id: makeToolCallId(),
+            type: 'function',
+            function: { name, arguments: jsonResult.json },
+          });
+          const after = afterName.slice(jsonResult.end).trim();
+          if (after) leftover.push(after);
+          continue;
+        } catch { /* fall through */ }
+      }
+    }
+    leftover.push(parts[i]);
+  }
+
+  const remaining = [prefix, ...leftover].join('').trim();
+  return { text: remaining, toolCalls };
+}
+
+/** Parse <tool_call>...</tool_call> tags (Hermes JSON or Qwen3 XML). */
+function parseToolCallTags(text) {
+  if (!text.includes('<tool_call>') && !text.includes('<function=')) {
+    return { text, toolCalls: [] };
+  }
+
+  const toolCalls = [];
+  let remaining = text;
+
+  // <tool_call>...</tool_call> blocks
+  const tagRe = /<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/g;
+  let tagMatch;
+  const matched = [];
+  while ((tagMatch = tagRe.exec(remaining)) !== null) {
+    const body = tagMatch[1].trim();
+    matched.push(tagMatch[0]);
+
+    // Try JSON (Hermes format)
+    const jsonStart = body.indexOf('{');
+    if (jsonStart >= 0) {
+      const jsonResult = extractJsonObject(body, jsonStart);
+      if (jsonResult) {
+        try {
+          const parsed = JSON.parse(jsonResult.json);
+          const found = findToolCallInObject(parsed);
+          if (found) {
+            toolCalls.push({
+              id: makeToolCallId(),
+              type: 'function',
+              function: {
+                name: found.name,
+                arguments: typeof found.arguments === 'string' ? found.arguments : JSON.stringify(found.arguments ?? {}),
+              },
+            });
+            continue;
+          }
+        } catch { /* fall through to XML parsing */ }
+      }
+    }
+
+    // Try Qwen3 XML inside <tool_call>
+    const fnCalls = parseQwenFunctionCalls(body);
+    toolCalls.push(...fnCalls);
+  }
+  for (const m of matched) remaining = remaining.replace(m, '');
+
+  // Bare <function=Name>...</function> (without <tool_call> wrapper)
+  if (remaining.includes('<function=') && toolCalls.length === 0) {
+    const fnCalls = parseQwenFunctionCalls(remaining);
+    if (fnCalls.length > 0) {
+      toolCalls.push(...fnCalls);
+      remaining = remaining.replace(/<function=\w+>[\s\S]*?(?:<\/function>|$)/g, '');
+    }
+  }
+
+  return { text: remaining.trim(), toolCalls };
+}
+
+/** Parse Qwen3 <function=Name><parameter=key>value</parameter></function>. */
+function parseQwenFunctionCalls(text) {
+  const toolCalls = [];
+  const fnRe = /<function=(\w+)>([\s\S]*?)(?:<\/function>|$)/g;
+  let fnMatch;
+  while ((fnMatch = fnRe.exec(text)) !== null) {
+    const name = fnMatch[1];
+    const body = fnMatch[2];
+
+    // Try JSON body first
+    const jsonStart = body.indexOf('{');
+    if (jsonStart >= 0) {
+      const jsonResult = extractJsonObject(body, jsonStart);
+      if (jsonResult) {
+        try {
+          JSON.parse(jsonResult.json);
+          toolCalls.push({
+            id: makeToolCallId(),
+            type: 'function',
+            function: { name, arguments: jsonResult.json },
+          });
+          continue;
+        } catch { /* fall through */ }
+      }
+    }
+
+    // Parse <parameter=key>value</parameter> (or value terminated by next param/end)
+    const params = {};
+    const paramRe = /<parameter=(\w+)>([\s\S]*?)(?:<\/parameter>|(?=<parameter=)|(?=<\/function>)|$)/g;
+    let pm;
+    while ((pm = paramRe.exec(body)) !== null) {
+      params[pm[1]] = pm[2].trim();
+    }
+    if (Object.keys(params).length > 0) {
+      toolCalls.push({
+        id: makeToolCallId(),
+        type: 'function',
+        function: { name, arguments: JSON.stringify(params) },
+      });
+    }
+  }
+  return toolCalls;
+}
+
+/**
+ * Parse tool calls embedded in text by models that don't use the OpenAI
+ * function calling API. Returns { text, toolCalls } in OpenAI format.
+ *
+ * Handles Mistral [TOOL_CALLS], Qwen3 <function=>, Hermes <tool_call>.
+ */
+export function parseTextToolCalls(text) {
+  if (!text || typeof text !== 'string') return { text: text || '', toolCalls: [] };
+
+  // Try tag-based formats first (more specific)
+  let result = parseToolCallTags(text);
+  if (result.toolCalls.length > 0) return result;
+
+  // Try Mistral format
+  result = parseMistralToolCalls(text);
+  if (result.toolCalls.length > 0) return result;
+
+  return { text, toolCalls: [] };
+}
+
+/**
+ * Fix an OpenAI response that has tool calls embedded in text content.
+ * Only applies when message.content has text but message.tool_calls is empty.
+ */
+export function fixTextToolCalls(openaiData) {
+  const choice = (openaiData.choices || [])[0];
+  if (!choice?.message) return openaiData;
+
+  const message = choice.message;
+  if (!message.content || (message.tool_calls && message.tool_calls.length > 0)) {
+    return openaiData;
+  }
+
+  const { text, toolCalls } = parseTextToolCalls(message.content);
+  if (toolCalls.length === 0) return openaiData;
+
+  message.content = text || null;
+  message.tool_calls = toolCalls;
+  choice.finish_reason = 'tool_calls';
+
+  return openaiData;
+}
+
+/** Prefixes used to detect text-based tool calls during streaming. */
+export const TOOL_CALL_TEXT_PREFIXES = ['[TOOL_CALLS]', '<tool_call>', '<function='];
+
+// ---------------------------------------------------------------------------
 // Schema utilities
 // ---------------------------------------------------------------------------
 
@@ -79,12 +353,53 @@ function translateMessages(payload) {
           }
         } else if (btype === 'tool_use') {
           toolCalls.push({
-            id: block.id || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+            id: block.id || makeToolCallId(),
             type: 'function',
             function: {
               name: block.name || '',
               arguments: JSON.stringify(block.input || {}),
             },
+          });
+        } else if (btype === 'server_tool_use') {
+          // Server tool use in history — treat like a regular tool call
+          toolCalls.push({
+            id: block.id || makeToolCallId(),
+            type: 'function',
+            function: {
+              name: block.name || '',
+              arguments: JSON.stringify(block.input || {}),
+            },
+          });
+        } else if (btype === 'web_search_tool_result') {
+          // Server tool result in history — convert to tool message
+          let rc = '';
+          const c = block.content;
+          if (Array.isArray(c)) {
+            rc = c.map(r => `${r.title || ''}: ${r.url || ''}\n${r.encrypted_content || r.description || ''}`).join('\n\n');
+          } else if (c && c.type === 'web_search_tool_result_error') {
+            rc = `Error: ${c.message || 'search failed'}`;
+          } else {
+            rc = JSON.stringify(c);
+          }
+          toolResults.push({
+            role: 'tool',
+            content: rc,
+            tool_call_id: block.tool_use_id || '',
+          });
+        } else if (btype === 'web_fetch_tool_result') {
+          let rc = '';
+          const c = block.content;
+          if (c && c.type === 'web_fetch_result') {
+            rc = c.content?.source?.data || JSON.stringify(c);
+          } else if (c && c.type === 'web_fetch_tool_result_error') {
+            rc = `Error: ${c.message || 'fetch failed'}`;
+          } else {
+            rc = JSON.stringify(c);
+          }
+          toolResults.push({
+            role: 'tool',
+            content: rc,
+            tool_call_id: block.tool_use_id || '',
           });
         } else if (btype === 'tool_result') {
           let rc = block.content || '';
@@ -101,11 +416,12 @@ function translateMessages(payload) {
             tool_call_id: block.tool_use_id || '',
           });
         }
-        // thinking blocks silently skipped
+        // thinking blocks, code_execution results silently skipped
       }
     }
 
-    // Build main message
+    // Build main message — skip empty user messages that only contain tool_result
+    // blocks, since the results are emitted as separate tool messages below.
     const openaiMsg = { role };
     if (contentParts.length === 1 && contentParts[0].type === 'text') {
       openaiMsg.content = contentParts[0].text;
@@ -115,7 +431,9 @@ function translateMessages(payload) {
       openaiMsg.content = '';
     }
     if (toolCalls.length > 0) openaiMsg.tool_calls = toolCalls;
-    messages.push(openaiMsg);
+    if (contentParts.length > 0 || toolCalls.length > 0 || toolResults.length === 0) {
+      messages.push(openaiMsg);
+    }
 
     // Tool results as separate messages
     messages.push(...toolResults);
@@ -212,7 +530,7 @@ export function translateResponse(openaiData, model) {
     }
     content.push({
       type: 'tool_use',
-      id: tc.id || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+      id: tc.id || makeToolCallId(),
       name: func.name || '',
       input: inputData,
     });

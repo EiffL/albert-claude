@@ -15,7 +15,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test test/test-translate.js test/test-stream.js test/test-integration.js"
+    "test": "node --test test/test-translate.js test/test-stream.js test/test-server-tools.js test/test-integration.js"
   },
   "keywords": [
     "claude",

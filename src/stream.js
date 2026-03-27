@@ -4,8 +4,7 @@
  * Direct port of the tested Python StreamTranslator class.
  */
 
-import { makeMsgId, mapStopReason } from './translate.js';
-import crypto from 'node:crypto';
+import { makeMsgId, mapStopReason, parseTextToolCalls, TOOL_CALL_TEXT_PREFIXES, makeToolCallId } from './translate.js';
 
 /** Format a single SSE event. */
 export function formatSSE(event, data) {
@@ -23,6 +22,10 @@ export class StreamTranslator {
     this._toolArgs = new Map();    // OAI tc index -> accumulated args
     this._hasTools = false;
     this._usage = null;
+    // Text buffering for detecting text-based tool calls (Mistral, Qwen, etc.)
+    this._textBuffer = '';
+    this._bufferingText = true;    // true while deciding if text is tool calls
+    this._textToolCallMode = false; // true once a tool call prefix is detected
   }
 
   _allocIndex() {
@@ -36,6 +39,28 @@ export class StreamTranslator {
       index: this._textIndex,
     })];
     this._textIndex = null;
+    return events;
+  }
+
+  /** Flush buffered text as a normal text block. */
+  _flushTextBuffer() {
+    const events = [];
+    if (!this._textBuffer) return events;
+    if (this._textIndex === null) {
+      const ci = this._allocIndex();
+      this._textIndex = ci;
+      events.push(formatSSE('content_block_start', {
+        type: 'content_block_start',
+        index: ci,
+        content_block: { type: 'text', text: '' },
+      }));
+    }
+    events.push(formatSSE('content_block_delta', {
+      type: 'content_block_delta',
+      index: this._textIndex,
+      delta: { type: 'text_delta', text: this._textBuffer },
+    }));
+    this._textBuffer = '';
     return events;
   }
 
@@ -69,13 +94,18 @@ export class StreamTranslator {
     if (!choices.length) return events;
     const delta = choices[0].delta || {};
 
-    // --- Tool calls ---
+    // --- Tool calls (proper API format) ---
     if (delta.tool_calls) {
       for (const tc of delta.tool_calls) {
         const oaiIdx = tc.index ?? 0;
         this._hasTools = true;
 
         if (!this._toolIndices.has(oaiIdx)) {
+          // Flush any buffered text before opening tool block
+          if (this._bufferingText && this._textBuffer) {
+            this._bufferingText = false;
+            events.push(...this._flushTextBuffer());
+          }
           // Close open text block first
           events.push(...this._closeTextBlock());
 
@@ -87,7 +117,7 @@ export class StreamTranslator {
             index: ci,
             content_block: {
               type: 'tool_use',
-              id: tc.id || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+              id: tc.id || makeToolCallId(),
               name: (tc.function || {}).name || '',
               input: {},
             },
@@ -111,6 +141,45 @@ export class StreamTranslator {
     }
     // --- Text content ---
     else if (delta.content) {
+      // If already detected text-based tool calls, just buffer
+      if (this._textToolCallMode) {
+        this._textBuffer += delta.content;
+        return events;
+      }
+
+      // Still deciding: buffer and check for tool call prefixes
+      if (this._bufferingText) {
+        this._textBuffer += delta.content;
+        const trimmed = this._textBuffer.trimStart();
+
+        // Check for known tool call prefixes
+        for (const prefix of TOOL_CALL_TEXT_PREFIXES) {
+          if (trimmed.startsWith(prefix)) {
+            this._textToolCallMode = true;
+            return events;
+          }
+        }
+
+        // First char rules out tool calls — flush immediately
+        const fc = trimmed[0];
+        if (fc && fc !== '[' && fc !== '<') {
+          this._bufferingText = false;
+          events.push(...this._flushTextBuffer());
+          return events;
+        }
+
+        // Enough chars to decide it's not a known prefix
+        if (trimmed.length >= 15) {
+          this._bufferingText = false;
+          events.push(...this._flushTextBuffer());
+          return events;
+        }
+
+        // Still undecided — keep buffering
+        return events;
+      }
+
+      // Normal text streaming (buffer already flushed)
       if (this._textIndex === null) {
         const ci = this._allocIndex();
         this._textIndex = ci;
@@ -128,6 +197,12 @@ export class StreamTranslator {
     }
     // --- Reasoning / thinking ---
     else if (delta.reasoning) {
+      // Flush buffered text if switching to reasoning
+      if (this._bufferingText && this._textBuffer) {
+        this._bufferingText = false;
+        events.push(...this._flushTextBuffer());
+        events.push(...this._closeTextBlock());
+      }
       if (this._textIndex === null) {
         const ci = this._allocIndex();
         this._textIndex = ci;
@@ -151,10 +226,78 @@ export class StreamTranslator {
   finish() {
     const events = [];
 
-    // Close open text/thinking block
-    events.push(...this._closeTextBlock());
+    // Handle buffered text (tool-call mode or still undecided at end of stream)
+    if (this._textToolCallMode || (this._bufferingText && this._textBuffer)) {
+      const { text, toolCalls } = parseTextToolCalls(this._textBuffer);
 
-    // Close all tool blocks
+      if (toolCalls.length > 0) {
+        // Emit remaining text if any
+        if (text) {
+          const ci = this._allocIndex();
+          events.push(formatSSE('content_block_start', {
+            type: 'content_block_start',
+            index: ci,
+            content_block: { type: 'text', text: '' },
+          }));
+          events.push(formatSSE('content_block_delta', {
+            type: 'content_block_delta',
+            index: ci,
+            delta: { type: 'text_delta', text },
+          }));
+          events.push(formatSSE('content_block_stop', {
+            type: 'content_block_stop',
+            index: ci,
+          }));
+        }
+
+        // Emit parsed tool calls as tool_use blocks
+        for (const tc of toolCalls) {
+          this._hasTools = true;
+          const ci = this._allocIndex();
+          events.push(formatSSE('content_block_start', {
+            type: 'content_block_start',
+            index: ci,
+            content_block: {
+              type: 'tool_use',
+              id: tc.id,
+              name: tc.function.name,
+              input: {},
+            },
+          }));
+          events.push(formatSSE('content_block_delta', {
+            type: 'content_block_delta',
+            index: ci,
+            delta: { type: 'input_json_delta', partial_json: tc.function.arguments },
+          }));
+          events.push(formatSSE('content_block_stop', {
+            type: 'content_block_stop',
+            index: ci,
+          }));
+        }
+      } else if (this._textBuffer) {
+        // No tool calls found — emit buffered text as plain text
+        const ci = this._allocIndex();
+        events.push(formatSSE('content_block_start', {
+          type: 'content_block_start',
+          index: ci,
+          content_block: { type: 'text', text: '' },
+        }));
+        events.push(formatSSE('content_block_delta', {
+          type: 'content_block_delta',
+          index: ci,
+          delta: { type: 'text_delta', text: this._textBuffer },
+        }));
+        events.push(formatSSE('content_block_stop', {
+          type: 'content_block_stop',
+          index: ci,
+        }));
+      }
+    } else {
+      // Normal path — close any open text/thinking block
+      events.push(...this._closeTextBlock());
+    }
+
+    // Close all proper API tool blocks
     for (const ci of this._toolIndices.values()) {
       events.push(formatSSE('content_block_stop', {
         type: 'content_block_stop',

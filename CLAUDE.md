@@ -28,6 +28,7 @@ Claude Code → POST /v1/messages → proxy (127.0.0.1:random) → POST /v1/chat
 - **proxy.js** — HTTP server on localhost. Handles `/v1/messages` (main proxy) and `/v1/messages/count_tokens` (stub). Supports both streaming and non-streaming responses.
 - **translate.js** — Pure functions for format conversion. Request: Anthropic content blocks → OpenAI messages, tool definitions, tool_choice. Response: OpenAI completion → Anthropic message format. Strips thinking blocks, filters BatchTool, removes `format: "uri"` from schemas.
 - **stream.js** — `StreamTranslator` class: stateful translator that processes OpenAI SSE chunks incrementally and emits Anthropic SSE events. Tracks content block indices and accumulates tool call arguments across chunks.
+- **server-tools.js** — Handles Anthropic server-side tools (web_search, web_fetch, code_execution). Detects them in requests, converts to function tools for the backend, executes search/fetch locally (Marginalia by default, Brave Search if configured), and runs a multi-turn loop to feed results back to the model.
 
 ## Key Design Decisions
 
@@ -36,6 +37,7 @@ Claude Code → POST /v1/messages → proxy (127.0.0.1:random) → POST /v1/chat
 - `StreamTranslator` is stateful by necessity — it maintains block index mappings and accumulated tool arguments across SSE chunks.
 - API keys stored with `0o600` permissions. Debug logging truncates message content and omits keys.
 - Token counting endpoint returns an estimate (text length / 4) since Albert doesn't expose token counting.
+- Server-side tools (web_search, web_fetch) are intercepted by the proxy, executed locally, and results are fed back to the model in a multi-turn loop. code_execution is stripped (Claude Code's Bash tool covers this). Web search defaults to Marginalia (Swedish, EU-funded, zero config), with optional Brave Search API for better results.
 
 ## Testing
 
@@ -43,4 +45,5 @@ Tests use Node.js built-in `node:test` module and `node:assert`. Three test file
 
 - **test-translate.js** — Unit tests for pure translation functions
 - **test-stream.js** — StreamTranslator chunk processing
-- **test-integration.js** — Spins up the proxy against a mock OpenAI backend, tests full request/response cycle including streaming, error handling, and edge cases
+- **test-server-tools.js** — Server tool detection, partitioning, function conversion, block injection, and history translation
+- **test-integration.js** — Spins up the proxy against a mock OpenAI backend, tests full request/response cycle including streaming, error handling, server tool handling, and edge cases

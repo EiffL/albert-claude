@@ -113,6 +113,7 @@ async function main() {
     apiKey: config.apiKey,
     model,
     debug: opts.debug,
+    braveApiKey: config.braveApiKey,
   });
   if (opts.debug) console.error(`ok (port ${port})`);
 

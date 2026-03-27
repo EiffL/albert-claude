@@ -35,6 +35,24 @@ function createMockOpenAI() {
         usage: { prompt_tokens: 10, completion_tokens: 5 },
       };
 
+      // Simulate Mistral-style text tool calls
+      if (lastMsg === 'mistral_tool' && hasTools) {
+        resp.choices[0].message = {
+          role: 'assistant',
+          content: '[TOOL_CALLS]' + body.tools[0].function.name + '{"query": "test"}',
+        };
+        resp.choices[0].finish_reason = 'stop';
+      }
+
+      // Simulate Qwen3-style text tool calls
+      if (lastMsg === 'qwen_tool' && hasTools) {
+        resp.choices[0].message = {
+          role: 'assistant',
+          content: '<function=' + body.tools[0].function.name + '><parameter=query>test</parameter></function>',
+        };
+        resp.choices[0].finish_reason = 'stop';
+      }
+
       if (lastMsg === 'use_tool' && hasTools) {
         resp.choices[0].message = {
           role: 'assistant',
@@ -46,6 +64,33 @@ function createMockOpenAI() {
           }],
         };
         resp.choices[0].finish_reason = 'tool_calls';
+      }
+
+      // If the model was given web_search results (tool role), respond with text
+      const hasToolResult = body.messages.some(m => m.role === 'tool');
+      if (hasToolResult && lastMsg !== 'use_tool') {
+        resp.choices[0].message = {
+          role: 'assistant',
+          content: 'Based on search results: found it',
+        };
+        resp.choices[0].finish_reason = 'stop';
+      }
+
+      // If told to search AND has web_search tool, call it
+      if (lastMsg === 'search_the_web' && hasTools) {
+        const wsToolIdx = body.tools.findIndex(t => t.function?.name === 'web_search');
+        if (wsToolIdx >= 0 && !hasToolResult) {
+          resp.choices[0].message = {
+            role: 'assistant',
+            content: null,
+            tool_calls: [{
+              id: 'call_ws_001',
+              type: 'function',
+              function: { name: 'web_search', arguments: '{"query": "test query"}' },
+            }],
+          };
+          resp.choices[0].finish_reason = 'tool_calls';
+        }
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -60,7 +105,14 @@ function createMockOpenAI() {
 
     send({ choices: [{ delta: { role: 'assistant' }, finish_reason: null }] });
 
-    if (lastMsg === 'use_tool' && hasTools) {
+    if (lastMsg === 'mistral_tool' && hasTools) {
+      // Simulate Mistral streaming text-based tool calls
+      const tcText = '[TOOL_CALLS]' + body.tools[0].function.name + '{"query": "test"}';
+      for (const ch of tcText) {
+        send({ choices: [{ delta: { content: ch }, finish_reason: null }] });
+      }
+      send({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 8 } });
+    } else if (lastMsg === 'use_tool' && hasTools) {
       send({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_s1', type: 'function', function: { name: body.tools[0].function.name, arguments: '' } }] }, finish_reason: null }] });
       send({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"query":' } }] }, finish_reason: null }] });
       send({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: ' "test"}' } }] }, finish_reason: null }] });
@@ -252,5 +304,105 @@ describe('integration', () => {
     assert.equal(res.status, 400);
     const data = await res.json();
     assert.ok(data.error.message.includes('messages'));
+  });
+
+  it('strips server tools and passes client tools through', async () => {
+    await setup;
+    const res = await postJSON(proxyPort, '/v1/messages', {
+      model: 'claude-3',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hello' }],
+      tools: [
+        { type: 'code_execution_20250825', name: 'code_execution' },
+        { name: 'search', description: 'Search', input_schema: { type: 'object' } },
+      ],
+    });
+    const data = await res.json();
+    assert.equal(data.type, 'message');
+    // code_execution should be stripped, search should work
+    assert.ok(data.content[0].text.includes('Hello'));
+  });
+
+  it('non-streaming Mistral text tool call', async () => {
+    await setup;
+    const res = await postJSON(proxyPort, '/v1/messages', {
+      model: 'claude-3',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'mistral_tool' }],
+      tools: [{ name: 'search', description: 'Search', input_schema: { type: 'object', properties: { query: { type: 'string' } } } }],
+    });
+    const data = await res.json();
+    assert.equal(data.stop_reason, 'tool_use');
+    const tc = data.content.find(b => b.type === 'tool_use');
+    assert.ok(tc, 'should have tool_use block');
+    assert.equal(tc.name, 'search');
+    assert.deepEqual(tc.input, { query: 'test' });
+  });
+
+  it('non-streaming Qwen3 text tool call', async () => {
+    await setup;
+    const res = await postJSON(proxyPort, '/v1/messages', {
+      model: 'claude-3',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'qwen_tool' }],
+      tools: [{ name: 'search', description: 'Search', input_schema: { type: 'object', properties: { query: { type: 'string' } } } }],
+    });
+    const data = await res.json();
+    assert.equal(data.stop_reason, 'tool_use');
+    const tc = data.content.find(b => b.type === 'tool_use');
+    assert.ok(tc, 'should have tool_use block');
+    assert.equal(tc.name, 'search');
+    assert.deepEqual(tc.input, { query: 'test' });
+  });
+
+  it('streaming Mistral text tool call', async () => {
+    await setup;
+    const res = await postJSON(proxyPort, '/v1/messages', {
+      model: 'claude-3',
+      max_tokens: 100,
+      stream: true,
+      messages: [{ role: 'user', content: 'mistral_tool' }],
+      tools: [{ name: 'search', description: 'Search', input_schema: { type: 'object' } }],
+    });
+    const text = await res.text();
+    const events = parseSSEEvents(text);
+
+    const blockStart = events.find(e => e[0] === 'content_block_start' && e[1].content_block?.type === 'tool_use');
+    assert.ok(blockStart, 'should have tool_use block start');
+    assert.equal(blockStart[1].content_block.name, 'search');
+
+    const jsonDeltas = events
+      .filter(e => e[0] === 'content_block_delta' && e[1].delta?.type === 'input_json_delta')
+      .map(e => e[1].delta.partial_json);
+    assert.ok(jsonDeltas.length > 0, 'should have JSON deltas');
+    assert.deepEqual(JSON.parse(jsonDeltas.join('')), { query: 'test' });
+
+    const msgDelta = events.find(e => e[0] === 'message_delta');
+    assert.equal(msgDelta[1].delta.stop_reason, 'tool_use');
+  });
+
+  it('handles server_tool_use blocks in conversation history', async () => {
+    await setup;
+    const res = await postJSON(proxyPort, '/v1/messages', {
+      model: 'claude-3',
+      max_tokens: 100,
+      messages: [
+        { role: 'user', content: 'search for something' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'server_tool_use', id: 'srvtoolu_prev', name: 'web_search', input: { query: 'something' } },
+            { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_prev', content: [
+              { type: 'web_search_result', url: 'https://example.com', title: 'Example', encrypted_content: 'Found it' },
+            ]},
+            { type: 'text', text: 'I found this page.' },
+          ],
+        },
+        { role: 'user', content: 'thanks' },
+      ],
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.type, 'message');
   });
 });

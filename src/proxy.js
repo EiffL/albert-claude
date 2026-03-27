@@ -5,8 +5,14 @@
  */
 
 import http from 'node:http';
-import { translateRequest, translateResponse } from './translate.js';
+import { translateRequest, translateResponse, fixTextToolCalls } from './translate.js';
 import { StreamTranslator, formatSSE } from './stream.js';
+import {
+  partitionTools,
+  serverToolToFunction,
+  serverToolLoop,
+  injectServerToolBlocks,
+} from './server-tools.js';
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -94,6 +100,80 @@ function readBody(req) {
 }
 
 // ---------------------------------------------------------------------------
+// SSE emission from non-streaming response
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert an Anthropic Messages response to an array of SSE event strings.
+ * Used when server tools forced a non-streaming call but the client expects SSE.
+ */
+function emitResponseAsSSE(anthropicResponse) {
+  const events = [];
+
+  // message_start (with empty content — blocks come separately)
+  events.push(formatSSE('message_start', {
+    type: 'message_start',
+    message: {
+      ...anthropicResponse,
+      content: [],
+      stop_reason: null,
+    },
+  }));
+  events.push(formatSSE('ping', { type: 'ping' }));
+
+  // Content blocks
+  for (let i = 0; i < (anthropicResponse.content || []).length; i++) {
+    const block = anthropicResponse.content[i];
+
+    if (block.type === 'text') {
+      events.push(formatSSE('content_block_start', {
+        type: 'content_block_start',
+        index: i,
+        content_block: { type: 'text', text: '' },
+      }));
+      events.push(formatSSE('content_block_delta', {
+        type: 'content_block_delta',
+        index: i,
+        delta: { type: 'text_delta', text: block.text },
+      }));
+    } else if (block.type === 'tool_use') {
+      events.push(formatSSE('content_block_start', {
+        type: 'content_block_start',
+        index: i,
+        content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} },
+      }));
+      events.push(formatSSE('content_block_delta', {
+        type: 'content_block_delta',
+        index: i,
+        delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) },
+      }));
+    } else {
+      // server_tool_use, *_tool_result blocks — emit as-is
+      events.push(formatSSE('content_block_start', {
+        type: 'content_block_start',
+        index: i,
+        content_block: block,
+      }));
+    }
+
+    events.push(formatSSE('content_block_stop', {
+      type: 'content_block_stop',
+      index: i,
+    }));
+  }
+
+  // message_delta + message_stop
+  events.push(formatSSE('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: anthropicResponse.stop_reason, stop_sequence: null },
+    usage: { output_tokens: anthropicResponse.usage?.output_tokens || 0 },
+  }));
+  events.push(formatSSE('message_stop', { type: 'message_stop' }));
+
+  return events;
+}
+
+// ---------------------------------------------------------------------------
 // Proxy server
 // ---------------------------------------------------------------------------
 
@@ -108,7 +188,7 @@ function readBody(req) {
  * @param {boolean} opts.debug - Enable debug logging
  * @returns {Promise<{server: http.Server, port: number}>}
  */
-export function startProxy({ port = 0, baseUrl, apiKey, model, debug = false }) {
+export function startProxy({ port = 0, baseUrl, apiKey, model, debug = false, braveApiKey } = {}) {
   const info = debug ? (...args) => console.error('[proxy]', ...args) : () => {};
   const dbg = debug ? (...args) => console.error('[proxy:debug]', ...args) : () => {};
 
@@ -155,50 +235,140 @@ export function startProxy({ port = 0, baseUrl, apiKey, model, debug = false }) 
 
       if (debug) debugRequest(dbg, 'Anthropic request', payload);
 
+      // --- Server tool handling ---
+      // Partition tools into server (web_search, web_fetch, code_execution)
+      // and client (Read, Write, Bash, etc.) tools.
+      const { server: serverTools, client: clientTools } = partitionTools(payload.tools);
+      payload.tools = clientTools;
+
+      const activeServerTools = [];
+      if (serverTools.length > 0) {
+        for (const st of serverTools) {
+          const fn = serverToolToFunction(st);
+          if (fn) activeServerTools.push(fn);
+        }
+        if (activeServerTools.length > 0) {
+          info(`Server tools active: ${activeServerTools.map(t => t.function.name).join(', ')}`);
+        }
+      }
+
       const openaiPayload = translateRequest(payload, model);
       const isStream = openaiPayload.stream;
+
+      // Inject synthetic function tools for active server tools
+      if (activeServerTools.length > 0) {
+        openaiPayload.tools = [...(openaiPayload.tools || []), ...activeServerTools];
+      }
 
       info(`stream=${isStream} messages=${openaiPayload.messages.length} tools=${(openaiPayload.tools || []).length}`);
 
       if (debug) debugRequest(dbg, 'OpenAI request', openaiPayload);
 
-      const headers = { 'Content-Type': 'application/json' };
-      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+      const upstreamHeaders = { 'Content-Type': 'application/json' };
+      if (apiKey) upstreamHeaders['Authorization'] = `Bearer ${apiKey}`;
+
+      /** Call the upstream backend (used by both direct calls and the server tool loop). */
+      async function callUpstream(body) {
+        const resp = await fetch(`${baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: upstreamHeaders,
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(300_000),
+        });
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => '');
+          throw Object.assign(new Error(`Backend returned ${resp.status}`), {
+            status: resp.status,
+            detail: errText,
+          });
+        }
+        return resp;
+      }
+
+      // When server tools are active, force non-streaming for the initial call
+      // so we can peek at the response and run the multi-turn loop if needed.
+      const hasActiveServerTools = activeServerTools.length > 0;
+      if (hasActiveServerTools && isStream) {
+        openaiPayload.stream = false;
+        delete openaiPayload.stream_options;
+      }
 
       let upstream;
       try {
-        upstream = await fetch(`${baseUrl}/chat/completions`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(openaiPayload),
-          signal: AbortSignal.timeout(300_000),
-        });
+        upstream = await callUpstream(openaiPayload);
       } catch (err) {
+        if (err.status) {
+          info(`Backend returned ${err.status}: ${(err.detail || '').slice(0, 200)}`);
+          return errorResponse(res, err.status, `Backend returned ${err.status}`);
+        }
         info(`Backend connection failed: ${err.message}`);
         return errorResponse(res, 502, `Backend connection failed: ${err.message}`);
       }
 
-      if (!upstream.ok) {
-        const errText = await upstream.text().catch(() => '');
-        info(`Backend returned ${upstream.status}: ${errText.slice(0, 200)}`);
-        return errorResponse(res, upstream.status, `Backend returned ${upstream.status}`);
-      }
-
-      // --- Non-streaming ---
-      if (!isStream) {
+      // --- Non-streaming (or forced non-streaming for server tools) ---
+      if (!isStream || hasActiveServerTools) {
         const data = await upstream.json();
         if (data.error) {
           return errorResponse(res, 500, data.error.message || 'Unknown error');
         }
+        fixTextToolCalls(data);
         if (debug) debugResponse(dbg, 'OpenAI response', data);
-        const result = translateResponse(data, model);
+
+        // Run server tool loop if the model called any server tools
+        let finalData = data;
+        let serverToolBlocks = [];
+
+        if (hasActiveServerTools) {
+          const serverToolNames = new Set(activeServerTools.map(t => t.function.name));
+          const toolCalls = data.choices?.[0]?.message?.tool_calls || [];
+          const hasServerCalls = toolCalls.some(tc => serverToolNames.has(tc.function?.name));
+
+          if (hasServerCalls) {
+            try {
+              const loopResult = await serverToolLoop({
+                openaiPayload,
+                firstResponse: data,
+                callUpstream: async (body) => {
+                  const r = await callUpstream(body);
+                  const json = await r.json();
+                  fixTextToolCalls(json);
+                  return json;
+                },
+                braveApiKey,
+                log: info,
+              });
+              finalData = loopResult.response;
+              serverToolBlocks = loopResult.serverToolBlocks;
+            } catch (err) {
+              info(`Server tool loop failed: ${err.message}`);
+              // Fall through with original response
+            }
+          }
+        }
+
+        let result = translateResponse(finalData, model);
+        result = injectServerToolBlocks(result, serverToolBlocks);
         if (debug) debugResponse(dbg, 'Anthropic response', result);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result));
+
+        // If the client originally requested streaming, emit as SSE events
+        if (isStream) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+          });
+          for (const evt of emitResponseAsSSE(result)) {
+            res.write(evt);
+          }
+          res.end();
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        }
         return;
       }
 
-      // --- Streaming ---
+      // --- Streaming (no server tools) ---
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
